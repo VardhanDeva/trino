@@ -11,7 +11,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.trino.plugin.iceberg;
+package io.trino.plugin.iceberg.catalog.glue;
 
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
@@ -19,8 +19,12 @@ import com.amazonaws.services.s3.model.ListObjectsV2Request;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.trino.Session;
+import io.trino.plugin.iceberg.BaseIcebergConnectorTest;
+import io.trino.plugin.iceberg.IcebergQueryRunner;
+import io.trino.plugin.iceberg.SchemaInitializer;
 import io.trino.testing.QueryRunner;
 import io.trino.tpch.TpchTable;
+import org.intellij.lang.annotations.Language;
 import org.testng.SkipException;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.Parameters;
@@ -54,7 +58,7 @@ public class TestIcebergGlueConnectorTest
     {
         super(PARQUET);
         this.bucketName = requireNonNull(bucketName, "bucketName is null");
-        this.schemaName = "iceberg_connector_test_" + randomTableSuffix();
+        this.schemaName = "test_iceberg_connector_" + randomTableSuffix();
     }
 
     @Override
@@ -87,6 +91,60 @@ public class TestIcebergGlueConnectorTest
 
         // DROP TABLES should clean up any files, but clear the directory manually to be safe
         deleteObjects(bucketName, getBaseDirectory());
+    }
+
+    @Test
+    @Override
+    public void testInformationSchemaFiltering()
+    {
+        // Add schema name to WHERE condition because finding a table from all schemas in Glue is too slow
+        assertQuery(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = '" + schemaName + "' AND table_name = 'orders' LIMIT 1",
+                "SELECT 'orders' table_name");
+        assertQuery(
+                "SELECT table_name FROM information_schema.columns WHERE data_type = 'bigint' AND table_schema = '" + schemaName + "' AND table_name = 'customer' AND column_name = 'custkey' LIMIT 1",
+                "SELECT 'customer' table_name");
+    }
+
+    @Test
+    @Override
+    public void testSelectInformationSchemaColumns()
+    {
+        // Add schema name to WHERE condition and skip below query because finding a table from all schemas in Glue is too slow
+        // SELECT DISTINCT table_name FROM information_schema.columns WHERE table_schema = 'information_schema' OR rand() = 42 ORDER BY 1
+
+        String catalog = getSession().getCatalog().orElseThrow();
+        String schema = getSession().getSchema().orElseThrow();
+        String schemaPattern = schema.replaceAll(".$", "_");
+
+        @Language("SQL") String ordersTableWithColumns = "VALUES " +
+                "('orders', 'orderkey'), " +
+                "('orders', 'custkey'), " +
+                "('orders', 'orderstatus'), " +
+                "('orders', 'totalprice'), " +
+                "('orders', 'orderdate'), " +
+                "('orders', 'orderpriority'), " +
+                "('orders', 'clerk'), " +
+                "('orders', 'shippriority'), " +
+                "('orders', 'comment')";
+
+        assertQuery("SELECT table_schema FROM information_schema.columns WHERE table_schema = '" + schema + "' GROUP BY table_schema", "VALUES '" + schema + "'");
+        assertQuery("SELECT table_name FROM information_schema.columns WHERE table_schema = '" + schema + "' AND table_name = 'orders' GROUP BY table_name", "VALUES 'orders'");
+        assertQuery("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = '" + schema + "' AND table_name = 'orders'", ordersTableWithColumns);
+        assertQuery("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = '" + schema + "' AND table_name LIKE '%rders'", ordersTableWithColumns);
+        assertQuery("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema LIKE '" + schemaPattern + "' AND table_name LIKE '_rder_'", ordersTableWithColumns);
+        assertThat(query(
+                "SELECT table_name, column_name FROM information_schema.columns " +
+                        "WHERE table_catalog = '" + catalog + "' AND table_schema = '" + schema + "' AND table_name LIKE '%orders%'"))
+                .skippingTypesCheck()
+                .containsAll(ordersTableWithColumns);
+
+        assertQuerySucceeds("SELECT * FROM information_schema.columns WHERE table_schema = '" + schema + "'");
+        assertQuery("SELECT DISTINCT table_name, column_name FROM information_schema.columns WHERE table_schema = '" + schema + "' AND table_name LIKE '_rders'", ordersTableWithColumns);
+        assertQuerySucceeds("SELECT * FROM information_schema.columns WHERE table_catalog = '" + catalog + "' AND table_schema = '" + schema + "'");
+        assertQuery("SELECT table_name, column_name FROM information_schema.columns WHERE table_catalog = '" + catalog + "' AND table_schema = '" + schema + "' AND table_name LIKE '_rders'", ordersTableWithColumns);
+        assertQuerySucceeds("SELECT * FROM information_schema.columns WHERE table_catalog = '" + catalog + "' AND table_schema = '" + schema + "' AND table_name LIKE '%'");
+        assertQuery("SELECT column_name FROM information_schema.columns WHERE table_catalog = 'something_else' AND table_schema = '" + schema + "'", "SELECT '' WHERE false");
     }
 
     @Test
